@@ -1,0 +1,143 @@
+/*    ==Scripting Parameters==
+
+    Source Server Version : SQL Server 2008 R2 (10.50.6529)
+    Source Database Engine Edition : Microsoft SQL Server Enterprise Edition
+    Source Database Engine Type : Standalone SQL Server
+
+    Target Server Version : SQL Server 2008 R2
+    Target Database Engine Edition : Microsoft SQL Server Enterprise Edition
+    Target Database Engine Type : Standalone SQL Server
+*/
+
+USE [DBA]
+GO
+
+/****** Object:  StoredProcedure [dbo].[sp_long_running_queries_alert]    Script Date: 7/26/2019 3:48:46 PM ******/
+SET ANSI_NULLS ON
+GO
+
+SET QUOTED_IDENTIFIER ON
+GO
+
+create procedure [dbo].[sp_long_running_queries_alert]
+as
+begin
+
+
+DECLARE @tableHTML NVARCHAR(max)
+
+DECLARE @body NVARCHAR(max)
+-- specify long running query duration threshold
+DECLARE @longrunningthreshold int
+SET @longrunningthreshold=30
+-- step 1: collect long running query details.
+
+
+create table ##Query_details
+(
+[Session_id] int,
+[Sessioin_start_time] datetime,
+[Session_status] varchar(max),
+[Session_Duration] INT,
+[Session_query] nvarchar(max )
+)
+insert into ##Query_details
+(
+[Session_id],
+[Sessioin_start_time],
+[Session_status],
+[Session_Duration],
+[Session_query]
+)
+SELECT [Session_id]=spid,
+[Sessioin_start_time]=(SELECT start_time
+FROM sys.dm_exec_requests
+WHERE spid = session_id),
+[Session_status]=Ltrim(Rtrim([status])),
+[Session_Duration]=Datediff(mi, (SELECT start_time
+FROM sys.dm_exec_requests
+WHERE spid = session_id),
+Getdate()
+),
+[Session_query] = Substring (st.text, ( qs.stmt_start / 2 ) + 1,
+( ( CASE qs.stmt_end
+WHEN -1
+THEN
+Datalength(st.text)
+ELSE qs.stmt_end
+END
+-
+qs.stmt_start ) / 2 ) +
+1)
+FROM sys.sysprocesses qs
+CROSS apply sys.dm_exec_sql_text(sql_handle) st
+
+--select * from ##Query_details
+ 
+
+---- step 2: generate html table 
+--SELECT @tableHTML = Cast((SELECT Session_id AS 'td',
+--'',
+--Session_Duration AS 'td',
+--'',
+--Session_status AS 'td',
+--'',
+--[Session_query] AS 'td'
+--FROM cte
+--WHERE Session_Duration >= @longrunningthreshold 
+--FOR xml path('tr'), elements) AS NVARCHAR(max))
+
+Select @tableHTML  = '
+<html>
+<body>
+    
+        <table border="1" style=
+        "background-color: #87cefa; border-collapse: separate">
+        <caption style="font-weight: lighter">
+            ****** 
+            Please find the Long running Queries ( Limit > 30 Minutes ) 
+             ******
+        </caption>
+
+<tr>
+    <th style="width:5%; text-decoration: underline">Session_id</th>
+	<th style="width:5%; text-decoration: underline">Sessioin_start_time</th>
+    <th style="text-decoration: underline">Session_Duration</th>
+	<th style="text-decoration: underline">Session_status</th>
+    <th style="text-decoration: underline">Session_query</th>
+</tr>' + Cast((SELECT Session_id AS 'td',
+'',
+Sessioin_start_time as 'td',
+'',
+Session_Duration AS 'td',
+'',
+Session_status AS 'td',
+'',
+[Session_query] AS 'td'
+FROM ##Query_details
+WHERE Session_Duration >= @longrunningthreshold 
+FOR xml path('tr'), elements) AS NVARCHAR(max)) +'
+    </table>
+</body>
+</html>';
+
+IF EXISTS(select 1 from ##Query_details where Session_Duration>@longrunningthreshold)
+begin
+
+Declare @server varchar(max)
+
+set @server = 'Long running Queries Report ' + @@SERVERNAME
+ EXEC msdb.dbo.sp_send_dbmail @profile_name = 'SQL Maintenance Administrator'
+        ,@recipients = 'SQLDBAServices@anheuser-busch.com'
+             ,@subject = @server
+        ,@execute_query_database = 'msdb',
+@body = @tableHTML,
+
+@body_format = 'HTML'
+
+end
+DROP TABLE ##Query_details
+
+end
+
+GO

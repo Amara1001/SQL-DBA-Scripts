@@ -1,0 +1,586 @@
+---
+alter database stockticker set single_user with rollback immediate
+go
+alter database stockticker set offline 
+
+--Backup databases information
+--------------------------------------------------------------
+SELECT 
+CONVERT(CHAR(100), SERVERPROPERTY('Servername')) AS Server, 
+msdb.dbo.backupset.database_name, 
+msdb.dbo.backupset.backup_start_date, 
+msdb.dbo.backupset.backup_finish_date, 
+--msdb.dbo.backupset.expiration_date, 
+CASE msdb..backupset.type 
+WHEN 'D' THEN 'Full'
+WHEN 'I' THEN 'Differential'
+WHEN 'L' THEN 'Log' 
+END AS backup_type, 
+--msdb.dbo.backupset.backup_size, 
+msdb.dbo.backupmediafamily.logical_device_name, 
+msdb.dbo.backupmediafamily.physical_device_name, 
+--msdb.dbo.backupset.name AS backupset_name, 
+msdb.dbo.backupset.description 
+FROM msdb.dbo.backupmediafamily 
+INNER JOIN msdb.dbo.backupset ON msdb.dbo.backupmediafamily.media_set_id = msdb.dbo.backupset.media_set_id 
+WHERE (CONVERT(datetime, msdb.dbo.backupset.backup_start_date, 102) >= GETDATE() - 1) 
+ORDER BY 
+msdb.dbo.backupset.database_name, 
+msdb.dbo.backupset.backup_finish_date 
+-------------------------------------------------------------------------------------------------
+--Backup & Restore Status
+--------------------------------------------
+SELECT session_id as SPID, command, a.text AS Query, start_time, percent_complete, dateadd(second,estimated_completion_time/1000, getdate()) as estimated_completion_time 
+FROM sys.dm_exec_requests r CROSS APPLY sys.dm_exec_sql_text(r.sql_handle) a 
+WHERE r.command in ('BACKUP DATABASE','RESTORE DATABASE')
+----------------------------------------------------------------------------------------------------
+--Check space on database files
+--------------------------------------------------------------------------------------------------
+SELECT RTRIM(name) AS [Segment Name], groupid AS [Group Id], filename AS [File Name],
+   CAST(size/128.0 AS DECIMAL(10,2)) AS [Allocated Size in MB],
+   CAST(FILEPROPERTY(name, 'SpaceUsed')/128.0 AS DECIMAL(10,2)) AS [Space Used in MB],
+   CAST([maxsize]/128.0 AS DECIMAL(10,2)) AS [Max in MB],
+   CAST(size/128.0-(FILEPROPERTY(name, 'SpaceUsed')/128.0) AS DECIMAL(10,2)) AS [Available Space in MB],
+   CAST((CAST(FILEPROPERTY(name, 'SpaceUsed')/128.0 AS DECIMAL(10,2))/CAST(size/128.0 AS DECIMAL(10,2)))*100 AS DECIMAL(10,2)) AS [Percent Used]
+FROM sysfiles
+ORDER BY groupid DESC
+-------------------------------------------------------------------------------------------------
+--Check DBCC shrink percentage
+SELECT percent_complete, start_time, status, command, estimated_completion_time, cpu_time, total_elapsed_time
+FROM sys.dm_exec_requests
+
+
+select
+a.FILEID,
+[FILE_SIZE_MB] =
+convert(decimal(12,2),round(a.size/128.000,2)),
+[SPACE_USED_MB] =
+convert(decimal(12,2),round(fileproperty(a.name,'SpaceUsed')/128.000,2)),
+[FREE_SPACE_MB] =
+convert(decimal(12,2),round((a.size-fileproperty(a.name,'SpaceUsed'))/128.000,2)) ,
+NAME = left(a.NAME,15),
+FILENAME = left(a.FILENAME,30)
+from
+dbo.sysfiles a
+------------------------------------------------------------------------------------------------
+--Check index frgmentation on all tables on Database
+SELECT dbschemas.[name] as 'Schema',
+dbtables.[name] as 'Table',
+dbindexes.[name] as 'Index',
+indexstats.avg_fragmentation_in_percent,
+indexstats.page_count
+FROM sys.dm_db_index_physical_stats (DB_ID(), NULL, NULL, NULL, NULL) AS indexstats
+INNER JOIN sys.tables dbtables on dbtables.[object_id] = indexstats.[object_id]
+INNER JOIN sys.schemas dbschemas on dbtables.[schema_id] = dbschemas.[schema_id]
+INNER JOIN sys.indexes AS dbindexes ON dbindexes.[object_id] = indexstats.[object_id]
+AND indexstats.index_id = dbindexes.index_id
+WHERE indexstats.database_id = DB_ID() and indexstats.page_count>1000
+ORDER BY indexstats.avg_fragmentation_in_percent desc
+----------------------------------------------------------------------------------------------------------------------
+--CPU usage by db\
+
+WITH CPU_Per_Db
+AS
+(SELECT 
+ dmpa.DatabaseID
+ , DB_Name(dmpa.DatabaseID) AS [Database]
+ , SUM(dmqs.total_worker_time) AS CPUTimeAsMS
+ FROM sys.dm_exec_query_stats dmqs 
+ CROSS APPLY 
+ (SELECT 
+ CONVERT(INT, value) AS [DatabaseID] 
+ FROM sys.dm_exec_plan_attributes(dmqs.plan_handle)
+ WHERE attribute = N'dbid') dmpa
+ GROUP BY dmpa.DatabaseID)
+ 
+ SELECT 
+ [Database] 
+ ,[CPUTimeAsMS] 
+ ,CAST([CPUTimeAsMS] * 1.0 / SUM([CPUTimeAsMS]) OVER() * 100.0 AS DECIMAL(5, 2)) AS [CPUTimeAs%]
+ FROM CPU_Per_Db
+ ORDER BY [CPUTimeAsMS] DESC;
+
+------------------------------------------------------------------------------------------------------------------------
+
+--Index Details on db\
+
+select i.[name] as index_name,
+    substring(column_names, 1, len(column_names)-1) as [columns],
+    case when i.[type] = 1 then 'Clustered index'
+        when i.[type] = 2 then 'Nonclustered unique index'
+        when i.[type] = 3 then 'XML index'
+        when i.[type] = 4 then 'Spatial index'
+        when i.[type] = 5 then 'Clustered columnstore index'
+        when i.[type] = 6 then 'Nonclustered columnstore index'
+        when i.[type] = 7 then 'Nonclustered hash index'
+        end as index_type,
+    case when i.is_unique = 1 then 'Unique'
+        else 'Not unique' end as [unique],
+    schema_name(t.schema_id) + '.' + t.[name] as table_view, 
+    case when t.[type] = 'U' then 'Table'
+        when t.[type] = 'V' then 'View'
+        end as [object_type]
+from sys.objects t
+    inner join sys.indexes i
+        on t.object_id = i.object_id
+    cross apply (select col.[name] + ', '
+                    from sys.index_columns ic
+                        inner join sys.columns col
+                            on ic.object_id = col.object_id
+                            and ic.column_id = col.column_id
+                    where ic.object_id = t.object_id
+                        and ic.index_id = i.index_id
+                            order by col.column_id
+                            for xml path ('') ) D (column_names)
+where t.is_ms_shipped <> 1
+and index_id > 0
+order by i.[name]
+
+-----------------------------------------------------------------------------------------------------
+
+-- Details About Statistics
+-- Original Author: Pinal Dave 
+
+SELECT DISTINCT
+OBJECT_NAME(s.[object_id]) AS TableName,
+c.name AS ColumnName,
+s.name AS StatName,
+s.auto_created,
+s.user_created,
+s.no_recompute,
+s.[object_id],
+s.stats_id,
+sc.stats_column_id,
+sc.column_id,
+STATS_DATE(s.[object_id], s.stats_id) AS LastUpdated
+FROM sys.stats s JOIN sys.stats_columns sc 
+              ON sc.[object_id] = s.[object_id] AND sc.stats_id = s.stats_id
+JOIN sys.columns c ON c.[object_id] = sc.[object_id] AND c.column_id = sc.column_id
+JOIN sys.partitions par ON par.[object_id] = s.[object_id]
+JOIN sys.objects obj ON par.[object_id] = obj.[object_id]
+WHERE OBJECTPROPERTY(s.OBJECT_ID,'IsUserTable') = 1
+AND (s.auto_created = 1 OR s.user_created = 1);
+
+--------------------------------------------------------------------------------------------------------
+
+--To get all the table details in db:
+
+SELECT 
+    t.NAME AS TableName,
+    s.Name AS SchemaName,
+    p.rows AS RowCounts,
+    SUM(a.total_pages) * 8 AS TotalSpaceKB, 
+    CAST(ROUND(((SUM(a.total_pages) * 8) / 1024.00), 2) AS NUMERIC(36, 2)) AS TotalSpaceMB,
+    SUM(a.used_pages) * 8 AS UsedSpaceKB, 
+    CAST(ROUND(((SUM(a.used_pages) * 8) / 1024.00), 2) AS NUMERIC(36, 2)) AS UsedSpaceMB, 
+    (SUM(a.total_pages) - SUM(a.used_pages)) * 8 AS UnusedSpaceKB,
+    CAST(ROUND(((SUM(a.total_pages) - SUM(a.used_pages)) * 8) / 1024.00, 2) AS NUMERIC(36, 2)) AS UnusedSpaceMB
+FROM 
+    sys.tables t
+INNER JOIN      
+    sys.indexes i ON t.OBJECT_ID = i.object_id
+INNER JOIN 
+    sys.partitions p ON i.object_id = p.OBJECT_ID AND i.index_id = p.index_id
+INNER JOIN 
+    sys.allocation_units a ON p.partition_id = a.container_id
+LEFT OUTER JOIN 
+    sys.schemas s ON t.schema_id = s.schema_id
+WHERE 
+    t.NAME NOT LIKE 'dt%' 
+    AND t.is_ms_shipped = 0
+    AND i.OBJECT_ID > 255 
+GROUP BY 
+    t.Name, s.Name, p.Rows
+ORDER BY 
+    t.Name
+
+-----------------------------------------------------------------------------------------------------------------
+--DB growth details by yearmonth
+
+DECLARE @endDate datetime, @months smallint; 
+SET @endDate = GetDate();  -- Include in the statistic all backups from today 
+SET @months = 6;           -- back to the last 6 months. 
+ 
+;WITH HIST AS 
+   (SELECT BS.database_name AS DatabaseName 
+          ,YEAR(BS.backup_start_date) * 100 
+           + MONTH(BS.backup_start_date) AS YearMonth 
+          ,CONVERT(numeric(10, 1), MIN(BF.file_size / 1048576.0)) AS MinSizeMB 
+          ,CONVERT(numeric(10, 1), MAX(BF.file_size / 1048576.0)) AS MaxSizeMB 
+          ,CONVERT(numeric(10, 1), AVG(BF.file_size / 1048576.0)) AS AvgSizeMB 
+    FROM msdb.dbo.backupset as BS 
+         INNER JOIN 
+         msdb.dbo.backupfile AS BF 
+             ON BS.backup_set_id = BF.backup_set_id 
+    WHERE NOT BS.database_name IN 
+              ('master', 'msdb', 'model', 'tempdb') 
+          AND BF.file_type = 'D' 
+          AND BS.backup_start_date BETWEEN DATEADD(mm, - @months, @endDate) AND @endDate 
+    GROUP BY BS.database_name 
+            ,YEAR(BS.backup_start_date) 
+            ,MONTH(BS.backup_start_date)) 
+SELECT MAIN.DatabaseName 
+      ,MAIN.YearMonth 
+      ,MAIN.MinSizeMB 
+      ,MAIN.MaxSizeMB 
+      ,MAIN.AvgSizeMB 
+      ,MAIN.AvgSizeMB  
+       - (SELECT TOP 1 SUB.AvgSizeMB 
+          FROM HIST AS SUB 
+          WHERE SUB.DatabaseName = MAIN.DatabaseName 
+                AND SUB.YearMonth < MAIN.YearMonth 
+          ORDER BY SUB.YearMonth DESC) AS GrowthMB 
+FROM HIST AS MAIN 
+ORDER BY MAIN.DatabaseName 
+        ,MAIN.YearMonth
+------------------------------------------------------------------------------------------------------------------------------------------------
+--Next DB users permissins backup
+
+DECLARE 
+    @sql VARCHAR(2048)
+    ,@sort INT 
+
+DECLARE tmp CURSOR FOR
+
+
+/*********************************************/
+/*********   DB CONTEXT STATEMENT    *********/
+/*********************************************/
+SELECT '-- [-- DB CONTEXT --] --' AS [-- SQL STATEMENTS --],
+        1 AS [-- RESULT ORDER HOLDER --]
+UNION
+SELECT  'USE' + SPACE(1) + QUOTENAME(DB_NAME()) AS [-- SQL STATEMENTS --],
+        1 AS [-- RESULT ORDER HOLDER --]
+
+UNION
+
+SELECT '' AS [-- SQL STATEMENTS --],
+        2 AS [-- RESULT ORDER HOLDER --]
+
+UNION
+
+/*********************************************/
+/*********     DB USER CREATION      *********/
+/*********************************************/
+
+SELECT '-- [-- DB USERS --] --' AS [-- SQL STATEMENTS --],
+        3 AS [-- RESULT ORDER HOLDER --]
+UNION
+SELECT  'IF NOT EXISTS (SELECT [name] FROM sys.database_principals WHERE [name] = ' + SPACE(1) + '''' + [name] + '''' + ') BEGIN CREATE USER ' + SPACE(1) + QUOTENAME([name]) + ' FOR LOGIN ' + QUOTENAME([name]) + ' WITH DEFAULT_SCHEMA = ' + QUOTENAME([default_schema_name]) + SPACE(1) + 'END; ' AS [-- SQL STATEMENTS --],
+        4 AS [-- RESULT ORDER HOLDER --]
+FROM    sys.database_principals AS rm
+WHERE [type] IN ('U', 'S', 'G') -- windows users, sql users, windows groups
+
+UNION
+
+/*********************************************/
+/*********    DB ROLE PERMISSIONS    *********/
+/*********************************************/
+SELECT '-- [-- DB ROLES --] --' AS [-- SQL STATEMENTS --],
+        5 AS [-- RESULT ORDER HOLDER --]
+UNION
+SELECT  'EXEC sp_addrolemember @rolename ='
+    + SPACE(1) + QUOTENAME(USER_NAME(rm.role_principal_id), '''') + ', @membername =' + SPACE(1) + QUOTENAME(USER_NAME(rm.member_principal_id), '''') AS [-- SQL STATEMENTS --],
+        6 AS [-- RESULT ORDER HOLDER --]
+FROM    sys.database_role_members AS rm
+WHERE   USER_NAME(rm.member_principal_id) IN (  
+                                                --get user names on the database
+                                                SELECT [name]
+                                                FROM sys.database_principals
+                                                WHERE [principal_id] > 4 -- 0 to 4 are system users/schemas
+                                                and [type] IN ('G', 'S', 'U') -- S = SQL user, U = Windows user, G = Windows group
+                                              )
+--ORDER BY rm.role_principal_id ASC
+
+
+UNION
+
+SELECT '' AS [-- SQL STATEMENTS --],
+        7 AS [-- RESULT ORDER HOLDER --]
+
+UNION
+
+/*********************************************/
+/*********  OBJECT LEVEL PERMISSIONS *********/
+/*********************************************/
+SELECT '-- [-- OBJECT LEVEL PERMISSIONS --] --' AS [-- SQL STATEMENTS --],
+        8 AS [-- RESULT ORDER HOLDER --]
+UNION
+SELECT  CASE 
+            WHEN perm.state <> 'W' THEN perm.state_desc 
+            ELSE 'GRANT'
+        END
+        + SPACE(1) + perm.permission_name + SPACE(1) + 'ON ' + QUOTENAME(SCHEMA_NAME(obj.schema_id)) + '.' + QUOTENAME(obj.name) --select, execute, etc on specific objects
+        + CASE
+                WHEN cl.column_id IS NULL THEN SPACE(0)
+                ELSE '(' + QUOTENAME(cl.name) + ')'
+          END
+        + SPACE(1) + 'TO' + SPACE(1) + QUOTENAME(USER_NAME(usr.principal_id)) COLLATE database_default
+        + CASE 
+                WHEN perm.state <> 'W' THEN SPACE(0)
+                ELSE SPACE(1) + 'WITH GRANT OPTION'
+          END
+            AS [-- SQL STATEMENTS --],
+        9 AS [-- RESULT ORDER HOLDER --]
+FROM    
+    sys.database_permissions AS perm
+        INNER JOIN
+    sys.objects AS obj
+            ON perm.major_id = obj.[object_id]
+        INNER JOIN
+    sys.database_principals AS usr
+            ON perm.grantee_principal_id = usr.principal_id
+        LEFT JOIN
+    sys.columns AS cl
+            ON cl.column_id = perm.minor_id AND cl.[object_id] = perm.major_id
+--WHERE usr.name = @OldUser
+--ORDER BY perm.permission_name ASC, perm.state_desc ASC
+
+
+
+UNION
+
+SELECT '' AS [-- SQL STATEMENTS --],
+    10 AS [-- RESULT ORDER HOLDER --]
+
+UNION
+
+/*********************************************/
+/*********    DB LEVEL PERMISSIONS   *********/
+/*********************************************/
+SELECT '-- [--DB LEVEL PERMISSIONS --] --' AS [-- SQL STATEMENTS --],
+        11 AS [-- RESULT ORDER HOLDER --]
+UNION
+SELECT  CASE 
+            WHEN perm.state <> 'W' THEN perm.state_desc --W=Grant With Grant Option
+            ELSE 'GRANT'
+        END
+    + SPACE(1) + perm.permission_name --CONNECT, etc
+    + SPACE(1) + 'TO' + SPACE(1) + '[' + USER_NAME(usr.principal_id) + ']' COLLATE database_default --TO <user name>
+    + CASE 
+            WHEN perm.state <> 'W' THEN SPACE(0) 
+            ELSE SPACE(1) + 'WITH GRANT OPTION' 
+      END
+        AS [-- SQL STATEMENTS --],
+        12 AS [-- RESULT ORDER HOLDER --]
+FROM    sys.database_permissions AS perm
+    INNER JOIN
+    sys.database_principals AS usr
+    ON perm.grantee_principal_id = usr.principal_id
+--WHERE usr.name = @OldUser
+
+WHERE   [perm].[major_id] = 0
+    AND [usr].[principal_id] > 4 -- 0 to 4 are system users/schemas
+    AND [usr].[type] IN ('G', 'S', 'U') -- S = SQL user, U = Windows user, G = Windows group
+
+UNION
+
+SELECT '' AS [-- SQL STATEMENTS --],
+        13 AS [-- RESULT ORDER HOLDER --]
+
+UNION 
+
+SELECT '-- [--DB LEVEL SCHEMA PERMISSIONS --] --' AS [-- SQL STATEMENTS --],
+        14 AS [-- RESULT ORDER HOLDER --]
+UNION
+SELECT  CASE
+            WHEN perm.state <> 'W' THEN perm.state_desc --W=Grant With Grant Option
+            ELSE 'GRANT'
+            END
+                + SPACE(1) + perm.permission_name --CONNECT, etc
+                + SPACE(1) + 'ON' + SPACE(1) + class_desc + '::' COLLATE database_default --TO <user name>
+                + QUOTENAME(SCHEMA_NAME(major_id))
+                + SPACE(1) + 'TO' + SPACE(1) + QUOTENAME(USER_NAME(grantee_principal_id)) COLLATE database_default
+                + CASE
+                    WHEN perm.state <> 'W' THEN SPACE(0)
+                    ELSE SPACE(1) + 'WITH GRANT OPTION'
+                    END
+            AS [-- SQL STATEMENTS --],
+        15 AS [-- RESULT ORDER HOLDER --]
+from sys.database_permissions AS perm
+    inner join sys.schemas s
+        on perm.major_id = s.schema_id
+    inner join sys.database_principals dbprin
+        on perm.grantee_principal_id = dbprin.principal_id
+WHERE class = 3 --class 3 = schema
+
+
+ORDER BY [-- RESULT ORDER HOLDER --]
+
+
+OPEN tmp
+FETCH NEXT FROM tmp INTO @sql, @sort
+WHILE @@FETCH_STATUS = 0
+BEGIN
+        PRINT @sql
+        FETCH NEXT FROM tmp INTO @sql, @sort    
+END
+
+CLOSE tmp
+DEALLOCATE tmp 
+---------------------------------------------------------------------------------------------------------------------------------------------
+--Next Get the details when SP last executed
+SELECT  
+    SCHEMA_NAME(sysobject.schema_id),
+    OBJECT_NAME(stats.object_id), 
+    stats.last_execution_time
+FROM   
+    sys.dm_exec_procedure_stats stats
+    INNER JOIN sys.objects sysobject ON sysobject.object_id = stats.object_id 
+WHERE  
+    sysobject.type = 'P'
+    and (sysobject.object_id = object_id('[dbo].[ABWEB2_UpdateArticle]') 
+    OR sysobject.name = '[dbo].[ABWEB2_UpdateArticle]')
+ORDER BY
+       stats.last_execution_time DESC
+------------------------------------------------------------------------------------------------------------
+---Next Get the details when SP last executed 
+
+SELECT st.text as SQL,qs.creation_time,qs.last_execution_time,qp.dbid,qp.objectid
+FROM sys.dm_exec_query_stats AS qs
+CROSS APPLY sys.dm_exec_sql_text(qs.sql_handle)AS st
+CROSS APPLY sys.dm_exec_text_query_plan(qs.plan_handle,DEFAULT,DEFAULT)AS qp
+WHERE st.text like '%ABWEB2_UpdateArticle%'
+----------------------------------------------------------------------------------------------------------------
+--Next Index size details on DB
+
+SELECT
+OBJECT_SCHEMA_NAME(i.OBJECT_ID) AS SchemaName,
+OBJECT_NAME(i.OBJECT_ID) AS TableName,
+i.name AS IndexName,
+i.index_id AS IndexID,
+8 * SUM(a.used_pages) AS 'Indexsize(KB)'
+FROM sys.indexes AS i
+JOIN sys.partitions AS p ON p.OBJECT_ID = i.OBJECT_ID AND p.index_id = i.index_id
+JOIN sys.allocation_units AS a ON a.container_id = p.partition_id
+GROUP BY i.OBJECT_ID,i.index_id,i.name
+ORDER BY OBJECT_NAME(i.OBJECT_ID),i.index_id 
+-------------------------------------------------------------------------------------------------------------------------
+---Next Queries for index rebuild, create indexes 
+drop index AB_ao_f1b27b_promise_target_time_millis_id_status on AO_F1B27B_PROMISE;
+
+create NONCLUSTERED index JiraSD.AB_ao_f1b27b_promise_target_time_millis_id_status on AO_F1B27B_PROMISE(TARGET_TIME_MILLIS, ID, STATUS);
+
+drop index AB_ao_f1b27b_promise_target_time_millis_id_status;
+
+create NONCLUSTERED index AB_ao_f1b27b_promise_target_time_millis_id_status on AO_F1B27B_PROMISE(ID, STATUS, TARGET_TIME_MILLIS);
+
+UPDATE STATISTICS [dbo].[jiraissue];
+
+select * into clustermessage_bkp from clustermessage where message_time < '2019-07-12 00:01:00.000'
+
+delete from clustermessage where message_time < '2019-07-12 00:01:00.000' and message like '%INSIGHT%'
+
+DBCC FREEPROCCACHE;
+GO
+DBCC FREESYSTEMCACHE ('ALL');
+GO
+DBCC FREESESSIONCACHE;
+GO
+
+ALTER INDEX ALL ON AO_F1B27B_PROMISE
+REBUILD;
+UPDATE STATISTICS AO_F1B27B_PROMISE; 
+--------------------------------------------------------------------------------------------------------------------------------------------
+---Next Get details about list logins have SYS Admin rights
+SELECT 'Name' = sp.NAME
+    ,sp.is_disabled AS [Is_disabled]
+FROM sys.server_role_members rm
+    ,sys.server_principals sp
+WHERE rm.role_principal_id = SUSER_ID('Sysadmin')
+    AND rm.member_principal_id = sp.principal_id
+--------------------------------------------------------------------------------------------------
+---Next Agent jobs details
+SELECT  sysjobs.name 'Job Name',
+        syscategories.name 'Category',
+        CASE [description]
+          WHEN 'No Description available.' THEN ''
+          ELSE [description]
+        END AS 'Description'
+FROM    msdb.dbo.sysjobs
+        INNER JOIN msdb.dbo.syscategories ON msdb.dbo.sysjobs.category_id = msdb.dbo.syscategories.category_id
+WHERE   syscategories.name <> 'Report Server'
+ORDER BY sysjobs.name 
+----------------------------------------------------------------------------------------------------------------------------
+---Next SQL2000 dtsx packages details
+use msdb
+GO
+select * from sysdtspackages
+select distinct name from sysdtspackages
+
+To change Owner
+-------------------
+sp_reassign_dtspackageowner
+'Archive and Clean ERC_ERRLOG',
+'7E4B4417-7A80-48EA-AF11-55716C30FB7C',
+'SA'
+select * from msdb..sysdtspackages
+-------------------------------------------------------------------------------
+---Next Sync logins script
+-- Exclude roles, and logins that are aliased to other users
+
+declare @SQLText nvarchar(4000),@UserName nvarchar(128)
+
+select  @UserName = min(name) from sysusers where issqluser = 1 and (sid is not null and sid <> 0x0) and suser_sname(sid) is null
+
+while @UserName is not null
+begin
+    if exists (select name from master.dbo.syslogins where name = @UserName)
+    begin
+        select @UserName + 'is being syncronized'
+        exec sp_change_users_login 'update_one', @UserName,@UserName
+    end
+
+    select  @UserName = min(name) from sysusers where name > @UserName and issqluser = 1 and (sid is not null and sid <> 0x0) and suser_sname(sid) is null
+
+end
+--------------------------------------------------------------------------------------------------------------------------------------
+---Next Get details of users part of DB role
+SELECT
+ SDP.name AS [User Name],
+ SDP.type_desc AS [User Type],
+ UPPER(SDPS.name) AS [Database Role]
+FROM sys.database_principals SDP
+INNER JOIN sys.database_role_members SDRM
+ON SDP.principal_id=SDRM.member_principal_id
+INNER JOIN sys.database_principals SDPS
+ON SDRM.role_principal_id = SDPS.principal_id
+where sdp.name  in ('KRONOSGROUP')
+GO  
+----get details of user for one db role
+sp_helprolemember'KRONOSGROUP'
+-----------------------------------------------------------------------------
+---Next Get level of access for customised database role
+SELECT DISTINCT rp.name, 
+                ObjectType = rp.type_desc, 
+                PermissionType = pm.class_desc, 
+                pm.permission_name, 
+                pm.state_desc, 
+                ObjectType = CASE 
+                               WHEN obj.type_desc IS NULL 
+                                     OR obj.type_desc = 'SYSTEM_TABLE' THEN 
+                               pm.class_desc 
+                               ELSE obj.type_desc 
+                             END, 
+                s.Name as SchemaName,
+                [ObjectName] = Isnull(ss.name, Object_name(pm.major_id)) 
+FROM   sys.database_principals rp 
+       INNER JOIN sys.database_permissions pm 
+               ON pm.grantee_principal_id = rp.principal_id 
+       LEFT JOIN sys.schemas ss 
+              ON pm.major_id = ss.schema_id 
+       LEFT JOIN sys.objects obj 
+              ON pm.[major_id] = obj.[object_id] 
+       LEFT JOIN sys.schemas s
+              ON s.schema_id = obj.schema_id
+WHERE  rp.type_desc = 'DATABASE_ROLE' 
+       AND pm.class_desc <> 'DATABASE' 
+ORDER  BY rp.name, 
+          rp.type_desc, 
+          pm.class_desc 
+-----------------------------------------------------------------------------------------------
+---Next Check SPN and creating SPN
+
+https://www.mssqltips.com/sqlservertip/4875/script-to-check-and-auto-generate-spns-for-sql-server/
+
+---------------------------------------------------------------------------------------------------------------------

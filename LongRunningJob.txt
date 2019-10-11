@@ -1,0 +1,111 @@
+/*    ==Scripting Parameters==
+
+    Source Server Version : SQL Server 2008 R2 (10.50.6529)
+    Source Database Engine Edition : Microsoft SQL Server Enterprise Edition
+    Source Database Engine Type : Standalone SQL Server
+
+    Target Server Version : SQL Server 2008 R2
+    Target Database Engine Edition : Microsoft SQL Server Enterprise Edition
+    Target Database Engine Type : Standalone SQL Server
+*/
+
+USE [DBA]
+GO
+
+/****** Object:  StoredProcedure [dbo].[sp_long_running_job_alert]    Script Date: 7/26/2019 3:48:41 PM ******/
+SET ANSI_NULLS ON
+GO
+
+SET QUOTED_IDENTIFIER ON
+GO
+
+
+
+Create procedure [dbo].[sp_long_running_job_alert]
+as
+begin
+
+CREATE TABLE ##DURATION
+(
+Server_name varchar(15),
+Job_name nvarchar(max),
+Job_Start_Date datetime,
+DURATION INT NULL
+
+)
+
+INSERT INTO ##DURATION
+(
+Server_name,
+Job_name,
+Job_Start_Date,
+DURATION
+)
+	SELECT @@servername as Server_name, sj.name as job_name, aj.start_execution_date as Job_Start_Date,DATEDIFF(SECOND, aj.start_execution_date, GETDATE()) as Duration 
+		FROM msdb..sysjobactivity aj
+		INNER JOIN msdb..sysjobs sj ON sj.job_id = aj.job_id
+		WHERE aj.stop_execution_date IS NULL -- condition: job hasn't stopped running 
+			AND aj.start_execution_date IS NOT NULL -- condition: job is currently running 
+			--AND sj.name = 'usp_LongRunningJobs' -- TODO: fill in the exact job name to monitor 
+			AND NOT EXISTS (
+				SELECT 1
+				FROM msdb..sysjobactivity new
+				WHERE new.job_id = aj.job_id
+					AND new.start_execution_date > aj.start_execution_date
+				) -- TODO: change 3600 below to desired treshold value in seconds 
+
+--SELECT * FROM ##DURATION
+	if exists(select * from ##DURATION WHERE DURATION >3600)
+	begin
+	
+DECLARE @tableHTML NVARCHAR(MAX) = '
+<html>
+<body>
+    
+        <table border="1" style=
+        "background-color: #87cefa; border-collapse: separate">
+        <caption style="font-weight: lighter">
+            ****** 
+            Please find the Long running jobs (Duration > 1 hour )
+             ******
+        </caption>
+
+<tr>
+    <th style="width:5%; text-decoration: underline">Server Name</th>
+    <th style="text-decoration: underline">Job Name</th>
+	<th style="text-decoration: underline">Job_Start_Date</th>
+    <th style="text-decoration: underline">Duration in Seconds</th>
+</tr>' + CAST((SELECT
+ td=Server_name, 
+ '', 
+td=Job_name ,
+'',
+td=Job_Start_Date,
+'',
+td=DURATION
+,''
+		FROM ##DURATION
+            FOR XML PATH('tr')
+                ,TYPE
+                ,ELEMENTS XSINIL
+            ) AS NVARCHAR(MAX)) + '
+    </table>
+</body>
+</html>';
+declare @subject varchar(max)='Long Running SQL Agent Job Alert  ' + @@servername
+
+ EXEC msdb.dbo.sp_send_dbmail @profile_name = 'SQL Maintenance Administrator'
+        ,@recipients = 'SQLDBAServices@anheuser-busch.com'
+             ,@subject = @subject
+			 ,@execute_query_database = 'msdb',
+@body = @tableHTML,
+
+@body_format = 'HTML'
+
+end
+
+drop table ##DURATION
+
+end
+
+GO

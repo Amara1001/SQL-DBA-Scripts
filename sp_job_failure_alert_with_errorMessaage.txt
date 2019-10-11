@@ -1,0 +1,107 @@
+/*    ==Scripting Parameters==
+
+    Source Server Version : SQL Server 2012 (11.0.7001)
+    Source Database Engine Edition : Microsoft SQL Server Standard Edition
+    Source Database Engine Type : Standalone SQL Server
+
+    Target Server Version : SQL Server 2012
+    Target Database Engine Edition : Microsoft SQL Server Standard Edition
+    Target Database Engine Type : Standalone SQL Server
+*/
+
+USE [DBA]
+GO
+
+/****** Object:  StoredProcedure [dbo].[sp_job_failure_alert_with_errorMessaage]    Script Date: 8/9/2019 1:14:42 AM ******/
+SET ANSI_NULLS ON
+GO
+
+SET QUOTED_IDENTIFIER ON
+GO
+
+
+
+Create procedure [dbo].[sp_job_failure_alert_with_errorMessaage]
+as
+begin
+declare @Job_ID uniqueidentifier 
+set @job_id=(select job_id from msdb.dbo.sysjobs where name ='JiraSDRptDW.dbo.usp_UpdateJiraIssue')
+
+
+
+  IF OBJECT_ID('tempdb.dbo.#TempJobFailRpt', 'U') IS NOT NULL
+  DROP TABLE #TempJobFailRpt; 
+
+
+DECLARE @job_name NVARCHAR(256) = (SELECT name FROM msdb.dbo.sysjobs WHERE job_id = @job_ID)
+--select @job_name
+DECLARE @msgbodynontable NVARCHAR(MAX) = 'SQL Server Agent Job Failure Report For: "' + @job_name + '" " Server Name - '+ @@Servername +'"'
+SELECT sjh.[server]
+    ,sj.NAME
+    ,sjh.step_id
+    ,sjh.[message]
+    ,sjh.run_date
+    ,sjh.run_time
+INTO #TempJobFailRpt
+FROM msdb..sysjobhistory sjh
+INNER JOIN msdb..sysjobs sj ON (sj.job_id = sjh.job_id)
+WHERE run_date = convert(INT, convert(VARCHAR(8), getdate(), 112))
+    AND run_status != 4 -- Do not show status of 4 meaning in progress steps
+    AND run_status != 1 -- Do not show status of 1 meaning success
+    AND NAME = @job_name
+ORDER BY run_date
+--select * from #TempJobFailRpt
+
+DECLARE @tableHTML NVARCHAR(MAX) = '
+<html>
+<body>
+    <H1>' + @msgbodynontable + '</H1>
+        <table border="1" style=
+        "background-color: #87cefa; border-collapse: separate">
+        <caption style="font-weight: lighter">
+            ****** 
+            Failure occurred in the SQL Agent job named: ''' + @job_name + ''' in at least one of the steps. 
+             ******
+        </caption>
+
+<tr>
+    <th style="width:5%; text-decoration: underline">SQL Instance</th>
+    <th style="text-decoration: underline">Job Name</th>
+    <th style="text-decoration: underline">Step</th>
+    <th style="text-decoration: underline">Message Text</th>
+    <th style="text-decoration: underline">Job Run Date</th>
+    <th style="text-decoration: underline">Job Run Time</th>
+</tr>' + CAST((
+            SELECT td = [server]
+                ,''
+                ,td = NAME
+                ,''
+                ,td = step_id
+                ,''
+                ,td = [message]
+                ,''
+                ,td = run_date
+                ,''
+                ,td = run_time
+            FROM #TempJobFailRpt a
+            ORDER BY run_date
+            FOR XML PATH('tr')
+                ,TYPE
+                ,ELEMENTS XSINIL
+            ) AS NVARCHAR(MAX)) + '
+    </table>
+</body>
+</html>';
+Declare @subject_d varchar(max)
+Set @subject_d ='JiraSDRptDW.dbo.usp_UpdateJiraIssue Job Failure Details - ' + @@servername
+EXEC msdb.dbo.sp_send_dbmail
+@profile_name = 'SQL Maintenance Administrator',
+@recipients = 'Anthony.Delgado@anheuser-busch.com,SQLDBAServices@anheuser-busch.com',
+@subject =@subject_d,
+@execute_query_database = 'msdb',
+@body = @tableHTML,
+@body_format = 'HTML'
+end
+GO
+
+
